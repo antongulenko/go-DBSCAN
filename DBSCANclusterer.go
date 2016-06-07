@@ -26,7 +26,11 @@ package dbscan
 
 import (
 	"container/list"
+	"fmt"
+	"log"
+	"runtime"
 	"sync"
+	"sync/atomic"
 )
 
 type Clusterer interface {
@@ -77,14 +81,20 @@ func (this *DBSCANClusterer) Cluster(data []ClusterablePoint) [][]ClusterablePoi
 
 	this.numDimensions = len(data[0].GetPoint())
 
+	log.Println("Predicting sort dimension...")
+
 	if this.AutoSelectDimension {
 		this.SortDimensionIndex = this.PredictDimensionByMaxVariance(data)
 	}
+
+	log.Println("Sorting on dimension", this.SortDimensionIndex)
 
 	ClusterablePointSlice{
 		Data:          data,
 		SortDimension: this.SortDimensionIndex,
 	}.Sort()
+
+	log.Println("Building neighborhood map...")
 
 	neighborhoodMap = this.BuildNeighborhoodMap(data)
 
@@ -105,10 +115,13 @@ func (this *DBSCANClusterer) Cluster(data []ClusterablePoint) [][]ClusterablePoi
 		elem  *list.Element
 	)
 
+	log.Println("Assiging points to clusters...")
+
 	for pointIndex, tmpIndex := 0, uint(0); pointIndex < dataSize; pointIndex += 1 {
 		if visitedMap[pointIndex] {
 			continue
 		}
+
 		// Expand cluster
 		queue.PushBack(uint(pointIndex))
 
@@ -151,48 +164,75 @@ func (this *DBSCANClusterer) CalcDistance(aPoint, bPoint []float64) float64 {
 
 func (this *DBSCANClusterer) BuildNeighborhoodMap(data []ClusterablePoint) []*ConcurrentQueue_InsertOnly {
 	var (
+		counter   = uint64(1)
 		dataSize  = len(data)
 		result    = make([]*ConcurrentQueue_InsertOnly, dataSize)
 		waitGroup = new(sync.WaitGroup)
 
 		fn = func(start int) {
-			defer waitGroup.Done()
 			var (
-				x, head ClusterablePoint = nil, data[start]
+				head ClusterablePoint = data[start]
 
 				headV    []float64 = head.GetPoint()
 				headDimV float64   = headV[this.SortDimensionIndex] + this.eps
 			)
-			if result[start] == nil {
-				result[start] = NewConcurrentQueue_InsertOnly()
+			startQueue := result[start]
+			if startQueue == nil {
+				panic(fmt.Sprintf("Queue for point %v not prepared!", start))
 			}
-			result[start].Add(uint(start))
+			startQueue.Add(uint(start))
 
-			for i := start + 1; i < dataSize && data[i].GetPoint()[this.SortDimensionIndex] <= headDimV; i += 1 {
-				x = data[i]
+			for i := start + 1; i < dataSize; i += 1 {
+				point := data[i].GetPoint()
+				if point[this.SortDimensionIndex] > headDimV {
+					break
+				}
 
-				if this.CalcDistance(headV, x.GetPoint()) <= this.eps2 {
-					result[start].Add(uint(i))
-					if result[i] == nil {
-						result[i] = NewConcurrentQueue_InsertOnly()
+				if this.CalcDistance(headV, point) <= this.eps2 {
+					startQueue.Add(uint(i))
+					if queue := result[i]; queue == nil {
+						panic(fmt.Sprintf("Queue for point %v not prepared!", i))
+					} else {
+						queue.Add(uint(start))
 					}
-					result[i].Add(uint(start))
+				}
+			}
+		}
+
+		routine = func() {
+			defer waitGroup.Done()
+			for {
+				unext := atomic.AddUint64(&counter, 1) - 1
+				next := int(unext)
+				if next >= dataSize {
+					break
+				}
+				fn(next)
+				if next%100 == 0 {
+					log.Println("Finished:", next, "size:", result[next].Size)
 				}
 			}
 		}
 	)
-	waitGroup.Add(dataSize)
+	for i := range data {
+		result[i] = NewConcurrentQueue_InsertOnly()
+	}
 
 	// Early exit - 1 huge cluster
 	fn(0)
-
 	if result[0].Size == uint64(dataSize) {
 		return result
 	}
 
-	for i := 1; i < dataSize; i += 1 {
-		go fn(i)
+	log.Println("Spawning routines...")
+
+	for i := 1; i < runtime.NumCPU()*2; i += 1 {
+		waitGroup.Add(1)
+		go routine()
 	}
+
+	log.Println("Now waiting...")
+
 	waitGroup.Wait()
 
 	return result
